@@ -141,9 +141,9 @@ func (o *GoogleCAS) Sign(ctx context.Context, cr signer.CertificateRequestObject
 		IssuingCertificateAuthorityId: issuerSpec.CertificateAuthorityId,
 	}
 
-	createCertResp, err := casClient.CreateCertificate(ctx, createCertificateRequest)
+	createCertResp, parent, err := createCertificateWithFallback(ctx, casClient, createCertificateRequest, parent, issuerSpec)
 	if err != nil {
-		return signer.PEMBundle{}, fmt.Errorf("casClient.CreateCertificate failed: %w", err)
+		return signer.PEMBundle{}, err
 	}
 
 	chainPEM, caPem, err := extractCertAndCA(createCertResp)
@@ -176,6 +176,56 @@ func (o *GoogleCAS) Sign(ctx context.Context, cr signer.CertificateRequestObject
 	}, err
 }
 
+func createCertificateWithFallback(
+	ctx context.Context,
+	casClient *privateca.CertificateAuthorityClient,
+	req *casapi.CreateCertificateRequest,
+	primaryParent string,
+	issuerSpec *issuersv1beta1.GoogleCASIssuerSpec,
+) (*casapi.Certificate, string, error) {
+
+	resp, err := casClient.CreateCertificate(ctx, req)
+	if err == nil {
+		return resp, primaryParent, nil
+	}
+
+	// Fail fast if no fallbacks are configured
+	if len(issuerSpec.Fallbacks) == 0 {
+		return nil, "", fmt.Errorf("casClient.CreateCertificate failed (no fallbacks configured): %w", err)
+	}
+
+	// Try each fallback in order
+	var fallbackErrs []error
+	for i, fb := range issuerSpec.Fallbacks {
+		fbParent, buildErr := buildFallbackParentString(fb)
+		if buildErr != nil {
+			fallbackErrs = append(fallbackErrs, fmt.Errorf("fallback[%d]: %w", i, buildErr))
+			continue
+		}
+
+		req.Parent = fbParent
+		req.Certificate.CertificateTemplate = fb.CertificateTemplate
+		req.IssuingCertificateAuthorityId = fb.CertificateAuthorityId
+		req.RequestId = uuid.New().String()
+
+		resp, fbErr := casClient.CreateCertificate(ctx, req)
+		if fbErr != nil {
+			fallbackErrs = append(fallbackErrs, fmt.Errorf("fallback[%d] (%s): %w", i, fbParent, fbErr))
+			continue
+		}
+
+		return resp, fbParent, nil
+	}
+
+	// All fallbacks failed — aggregate errors
+	allErrs := fmt.Sprintf("primary: %v", err)
+	for _, e := range fallbackErrs {
+		allErrs += fmt.Sprintf("; %v", e)
+	}
+	return nil, "", fmt.Errorf("all CA pools failed: %s", allErrs)
+}
+
+
 func buildParentString(issuerSpec *issuersv1beta1.GoogleCASIssuerSpec) (string, error) {
 	if issuerSpec.Project == "" {
 		return "", signer.PermanentError{Err: fmt.Errorf("must specify a Project")}
@@ -192,6 +242,20 @@ func buildParentString(issuerSpec *issuersv1beta1.GoogleCASIssuerSpec) (string, 
 	return parent, nil
 }
 
+// buildFallbackParentString constructs the GCP resource path for a fallback CA pool.
+func buildFallbackParentString(fb issuersv1beta1.FallbackCAPool) (string, error) {
+	if fb.Project == "" {
+		return "", signer.PermanentError{Err: fmt.Errorf("must specify a Project in fallback")}
+	}
+	if fb.Location == "" {
+		return "", signer.PermanentError{Err: fmt.Errorf("must specify a Location in fallback")}
+	}
+	if fb.CaPoolId == "" {
+		return "", signer.PermanentError{Err: fmt.Errorf("must specify a CaPoolId in fallback")}
+	}
+
+	return fmt.Sprintf("projects/%s/locations/%s/caPools/%s", fb.Project, fb.Location, fb.CaPoolId), nil
+}
 func (c *GoogleCAS) createCasClient(ctx context.Context, resourceNamespace string, issuerSpec *issuersv1beta1.GoogleCASIssuerSpec) (*privateca.CertificateAuthorityClient, string, error) {
 	parent, err := buildParentString(issuerSpec)
 	if err != nil {
